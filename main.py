@@ -450,7 +450,7 @@ def handle_adblocker(sb, account_index: int, result: Dict, context: str = "") ->
 def is_cloudflare_interstitial(sb) -> bool:
     try:
         has_login_form = sb.execute_script('''
-            return !!(document.querySelector('#loginformmodel-username')
+            return !!(document.querySelector('#login-auth-identity')
                    || document.querySelector('form[action*="/user/login"]'));
         ''')
         if has_login_form:
@@ -799,10 +799,11 @@ def handle_initial_page(sb, account_index: int, result: Dict) -> Optional[str]:
 
     for wait_round in range(3):
         try:
-            # 只等元素出现，不等“可见”：输入框父层透明度为 0，
-            # Selenium 会误判不可见（ElementNotVisibleException），
-            # 且该异常不属于 TimeoutException，旧写法会直接崩掉整个流程。
-            sb.wait_for_element_present('#loginformmodel-username', timeout=10)
+            # 等真字段 #login-auth-identity 出现（蜜罐假字段
+            # #loginformmodel-username 不要用，详见 fill_and_submit 注释）。
+            # 只等“出现”不等“可见”，且异常统一接住——旧写法等可见抛的
+            # ElementNotVisibleException 不属于 TimeoutException，会直接崩掉整个流程。
+            sb.wait_for_element_present('#login-auth-identity', timeout=10)
             logger.info("✅ 找到登录表单")
             return "need_login"
         except Exception:
@@ -818,9 +819,14 @@ def handle_initial_page(sb, account_index: int, result: Dict) -> Optional[str]:
     return None
 
 def fill_and_submit(sb, email: str, password: str, account_index: int, result: Dict) -> bool:
+    # 注意：登录表单里有两套账号密码框。#loginformmodel-username / -password 的
+    # name 是 LoginFormModel[account_alias] / [account_key]、tabindex=-1、藏在
+    # 透明层里，是蜜罐假字段，填了服务器也不认（会报 cannot be blank 打回）。
+    # 真字段是 #login-auth-identity / #login-auth-secret，name 为
+    # LoginFormModel[username] / [password]。假字段必须保持空着，不要动。
     logger.info("填写登录信息...")
-    _fill_input(sb, '#loginformmodel-username', email)
-    _fill_input(sb, '#loginformmodel-password', password)
+    _fill_input(sb, '#login-auth-identity', email)
+    _fill_input(sb, '#login-auth-secret', password)
     safe_screenshot(sb, screenshot_path(account_index, "03-form-filled"), result)
 
     # ---------- 处理登录 Turnstile ----------
@@ -847,8 +853,8 @@ def fill_and_submit(sb, email: str, password: str, account_index: int, result: D
                     return False
             time.sleep(4)
             # 重新填写表单
-            _fill_input(sb, '#loginformmodel-username', email)
-            _fill_input(sb, '#loginformmodel-password', password)
+            _fill_input(sb, '#login-auth-identity', email)
+            _fill_input(sb, '#login-auth-secret', password)
             safe_screenshot(sb, screenshot_path(account_index, "03-form-refilled"), result)
         else:
             logger.error("登录 Turnstile 连续失败，放弃本次登录")
@@ -856,15 +862,15 @@ def fill_and_submit(sb, email: str, password: str, account_index: int, result: D
 
     # 提交前用 JS 复填一次：页面脚本偶尔会清掉先前写入的值，
     # 否则提交后会被服务端判成 "cannot be blank" 打回登录页。
-    _js_fill_input(sb, '#loginformmodel-username', email)
-    _js_fill_input(sb, '#loginformmodel-password', password)
+    _js_fill_input(sb, '#login-auth-identity', email)
+    _js_fill_input(sb, '#login-auth-secret', password)
 
     logger.info("提交登录...")
     try:
         sb.click('button[type="submit"].btn-register')
     except:
         try:
-            sb.execute_script('document.querySelector("form").submit()')
+            sb.execute_script('document.querySelector("#login-form").submit()')
         except:
             logger.error("提交失败")
             return False
@@ -876,8 +882,12 @@ def fill_and_submit(sb, email: str, password: str, account_index: int, result: D
     if "/user/login" in current_url:
         try:
             err = sb.execute_script('''
-                var alert = document.querySelector('.alert-danger, .error-message');
-                return alert ? alert.innerText : '';
+                var texts = [];
+                document.querySelectorAll('.alert-danger, .error-message, .help-block, .alert, .text-danger, [class*="feedback"], div[class*="error"], p[class*="error"]').forEach(function(el) {
+                    var t = (el.innerText || '').trim();
+                    if (t && texts.indexOf(t) === -1) texts.push(t);
+                });
+                return texts.join(' | ').slice(0, 300);
             ''')
             if err:
                 logger.error(f"登录错误: {err}")
