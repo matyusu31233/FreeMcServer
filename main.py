@@ -31,42 +31,24 @@ logging.basicConfig(
 )
 logger = logging.getLogger("freemcserver-keepalive")
 
-# ================== 兼容性修复 ==================
-_IIFE_OPEN_RE = re.compile(r"^\s*\(\s*function\s*\([^)]*\)\s*\{")
-_IIFE_CLOSE_RE = re.compile(r"\}\s*\)\s*\(\s*\)\s*;?\s*$")
-
-
-def _unwrap_iife(script: str) -> str:
-    """把 `(function() { ... })();` 形式的脚本拆成裸脚本（函数体原样保留）。
-
-    两种执行环境对返回值的语义正好相反，只能用裸脚本 + 顶层 return 统一：
-    - 经典 WebDriver：脚本被包进函数体执行，IIFE 的返回值会被丢弃（恒为 None），
-      顶层 return 才是取回返回值的办法。
-    - CDP 模式（GitHub Actions 里的 SeleniumBase UC 驱动，2026-11-10 实测）：
-      裸脚本的顶层 return 能正常取回值（登录 token 长度 773 即如此读到）；
-      而给 IIFE 前面加 `return ` 会直接报 SyntaxError: Illegal return statement
-      ——2026-11-10 13:16 的 Actions 运行正是这样在 get_all_servers 崩掉的
-      （旧补丁加了 `return ` 前缀，登录虽成功，读服务器列表时整轮崩溃）。
-    拆掉 IIFE 外壳后，函数体里的 return 变成顶层 return，两种环境都能取回值；
-    只产生副作用（点击/滚动）的脚本拆开也无影响（函数体本就顺序执行）。
-    """
-    s = script.strip()
-    m = _IIFE_OPEN_RE.match(s)
-    if not m or not _IIFE_CLOSE_RE.search(s):
-        return script
-    return _IIFE_CLOSE_RE.sub("", s[m.end():])
-
-
+# ================== 兼容性说明（不要再给 execute_script 做任何变换）==================
 def _patch_execute_script(sb):
-    """统一所有 execute_script 的 IIFE 脚本为裸脚本，见 _unwrap_iife 说明。"""
-    orig_execute_script = sb.execute_script
+    """占位函数：保留调用点，实际不做任何变换。
 
-    def wrapped(script, *args, **kwargs):
-        if isinstance(script, str):
-            script = _unwrap_iife(script)
-        return orig_execute_script(script, *args, **kwargs)
-
-    sb.execute_script = wrapped
+    历史教训（2026-11-10 两轮 Actions 实测 + 本地同版本探针复现）：
+    本脚本经 SB(uc=True) 走 CDP 驱动（sb_cdp.evaluate），它对 IIFE 脚本
+    `(function() { ... return x; })();` 能原生取回返回值——本地用与
+    Actions 完全相同的 seleniumbase 4.57.1（traceback 行号逐行对齐）
+    逐字提取四段问题脚本实测：IIFE 原样全部返回正确值。
+    此前两种“修复”都把能跑的脚本改坏了：
+    - 给 IIFE 加 `return ` 前缀 → Actions 里 Illegal return statement，
+      2026-11-10 13:16 运行在 get_all_servers 崩溃；
+    - 拆掉 IIFE 外壳成裸脚本 → 带 if 内 return 的脚本（到期时间、
+      AdBlocker 检测、续订页就绪）全部 Illegal return statement，
+      13:39 运行崩在续订页就绪检查；只有服务器列表那段侥幸能跑。
+    结论：脚本保持原样，不要在此处加前缀、不要拆壳。
+    """
+    return None
 
 
 def _js_fill_input(sb, selector: str, value: str) -> bool:
