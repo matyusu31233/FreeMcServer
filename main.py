@@ -5,6 +5,7 @@ import os
 import sys
 import time
 import re
+import json
 import platform
 import logging
 import requests
@@ -29,6 +30,58 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 logger = logging.getLogger("freemcserver-keepalive")
+
+# ================== 兼容性修复 ==================
+def _patch_execute_script(sb):
+    """修复 execute_script 返回值丢失。
+
+    本脚本大量 JS 以 `(function() { ... return x; })();` 开头。
+    在 WebDriver 的 execute_script 语义下，这种写法的返回值会被丢弃（恒为 None），
+    导致读状态的脚本（服务器状态、到期时间、服务器列表等）全部读到空值。
+    统一给这类脚本补上 `return ` 前缀后，返回值即可正常取回；
+    只产生副作用（点击/滚动）的脚本补前缀也无影响。
+    """
+    orig_execute_script = sb.execute_script
+
+    def wrapped(script, *args, **kwargs):
+        if isinstance(script, str) and script.lstrip().startswith("(function"):
+            script = "return " + script.lstrip()
+        return orig_execute_script(script, *args, **kwargs)
+
+    sb.execute_script = wrapped
+
+
+def _js_fill_input(sb, selector: str, value: str) -> bool:
+    """用 JS 直接给输入框赋值（原生 setter + input/change 事件）。"""
+    try:
+        filled = sb.execute_script(
+            "var e = document.querySelector(" + json.dumps(selector) + ");"
+            "if (!e) return null;"
+            "e.focus();"
+            "var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;"
+            "setter.call(e, " + json.dumps(value) + ");"
+            "e.dispatchEvent(new Event('input', {bubbles: true}));"
+            "e.dispatchEvent(new Event('change', {bubbles: true}));"
+            "return e.value;"
+        )
+        return filled == value
+    except Exception as e:
+        logger.error(f"JS 填写 {selector} 失败: {e}")
+        return False
+
+
+def _fill_input(sb, selector: str, value: str) -> bool:
+    """填写输入框，带 JS 兜底。
+
+    登录页输入框的父层 div 计算透明度为 0，Selenium 的 is_displayed 会判定
+    其“不可见”，sb.type 因此抛 ElementNotVisibleException。此时改用 JS 赋值。
+    """
+    try:
+        sb.type(selector, value)
+        return True
+    except Exception as e:
+        logger.warning(f"常规填写 {selector} 失败，改用 JS 填写: {e}")
+    return _js_fill_input(sb, selector, value)
 
 # ================== 辅助函数 ==================
 def is_linux() -> bool:
@@ -499,8 +552,10 @@ def _wait_for_turnstile_token(sb, timeout: int = 25) -> bool:
     while time.time() - start < timeout:
         token_ready = sb.execute_script('''
             (function() {
-                var tokenInput = document.querySelector('input[name="cf-turnstile-response"]');
-                if (tokenInput && tokenInput.value && tokenInput.value.length > 20) return true;
+                var inputs = document.querySelectorAll('input[name="cf-turnstile-response"]');
+                for (var i = 0; i < inputs.length; i++) {
+                    if (inputs[i].value && inputs[i].value.length > 20) return true;
+                }
                 var renewBtn = document.querySelector('#renew-btn');
                 if (renewBtn && !renewBtn.disabled) return true;
                 var successEl = document.querySelector('#success');
@@ -640,13 +695,23 @@ def handle_turnstile_verification(sb, account_index: int, result: Dict,
 
 # ================== 登录 Turnstile 处理（新增） ==================
 def _wait_login_turnstile_token(sb, timeout=30) -> bool:
-    """等待登录 Turnstile 生成有效 token（基于 hidden input 长度）"""
+    """等待登录 Turnstile 生成有效 token。
+
+    注意：登录页上有多个 Turnstile 组件、多个同名 token 输入框，
+    真正完成验证的那个不一定是第一个。旧写法只读第一个输入框，
+    会出现组件已显示 Success、脚本却一直读到 0 并误报超时的情况。
+    改为检查所有同名输入框，任一有 token 即算完成。
+    """
     last_len = 0
     for _ in range(timeout):
         token_len = sb.execute_script('''
-            var inp = document.querySelector('input[name="cf-turnstile-response"]');
-            return inp ? inp.value.length : 0;
+            var inputs = document.querySelectorAll('input[name="cf-turnstile-response"]');
+            var max = 0;
+            inputs.forEach(function(i) { if (i.value.length > max) max = i.value.length; });
+            return max;
         ''')
+        if token_len is None:
+            token_len = 0
         if token_len > 20:
             logger.info(f"登录 Turnstile token 已生成 (长度 {token_len})")
             return True
@@ -693,7 +758,7 @@ def handle_login_turnstile(sb, account_index: int, result: Dict) -> bool:
                 logger.warning(f"uc_gui_click_captcha 失败: {e}")
 
         logger.info("等待 Turnstile 完成验证...")
-        if _wait_login_turnstile_token(sb, timeout=30):
+        if _wait_login_turnstile_token(sb, timeout=60):
             safe_screenshot(sb, screenshot_path(account_index, "login-turnstile-success"), result)
             return True
 
@@ -734,10 +799,13 @@ def handle_initial_page(sb, account_index: int, result: Dict) -> Optional[str]:
 
     for wait_round in range(3):
         try:
-            sb.wait_for_element_visible('#loginformmodel-username', timeout=10)
+            # 只等元素出现，不等“可见”：输入框父层透明度为 0，
+            # Selenium 会误判不可见（ElementNotVisibleException），
+            # 且该异常不属于 TimeoutException，旧写法会直接崩掉整个流程。
+            sb.wait_for_element_present('#loginformmodel-username', timeout=10)
             logger.info("✅ 找到登录表单")
             return "need_login"
-        except TimeoutException:
+        except Exception:
             logger.info(f"等待表单超时 ({wait_round+1}/3)")
             if is_cloudflare_interstitial(sb):
                 bypass_cloudflare_interstitial(sb, max_attempts=2)
@@ -751,8 +819,8 @@ def handle_initial_page(sb, account_index: int, result: Dict) -> Optional[str]:
 
 def fill_and_submit(sb, email: str, password: str, account_index: int, result: Dict) -> bool:
     logger.info("填写登录信息...")
-    sb.type('#loginformmodel-username', email)
-    sb.type('#loginformmodel-password', password)
+    _fill_input(sb, '#loginformmodel-username', email)
+    _fill_input(sb, '#loginformmodel-password', password)
     safe_screenshot(sb, screenshot_path(account_index, "03-form-filled"), result)
 
     # ---------- 处理登录 Turnstile ----------
@@ -765,15 +833,31 @@ def fill_and_submit(sb, email: str, password: str, account_index: int, result: D
         logger.warning(f"登录 Turnstile 失败（第 {retry+1}/{max_turnstile_retries} 次）")
         if retry < max_turnstile_retries - 1:
             logger.info("刷新页面重试 Turnstile …")
-            sb.refresh()
+            try:
+                sb.refresh()
+            except Exception as e:
+                # 网络慢时 refresh 本身会触发 WebDriver 读超时并抛异常，
+                # 不兜底的话会直接杀掉整个账号流程（本地实测踩过）。
+                # 改为重新打开登录页继续重试。
+                logger.warning(f"刷新页面失败，改走重新打开登录页: {e}")
+                try:
+                    sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=8)
+                except Exception as e2:
+                    logger.error(f"重新打开登录页也失败: {e2}")
+                    return False
             time.sleep(4)
             # 重新填写表单
-            sb.type('#loginformmodel-username', email)
-            sb.type('#loginformmodel-password', password)
+            _fill_input(sb, '#loginformmodel-username', email)
+            _fill_input(sb, '#loginformmodel-password', password)
             safe_screenshot(sb, screenshot_path(account_index, "03-form-refilled"), result)
         else:
             logger.error("登录 Turnstile 连续失败，放弃本次登录")
             return False
+
+    # 提交前用 JS 复填一次：页面脚本偶尔会清掉先前写入的值，
+    # 否则提交后会被服务端判成 "cannot be blank" 打回登录页。
+    _js_fill_input(sb, '#loginformmodel-username', email)
+    _js_fill_input(sb, '#loginformmodel-password', password)
 
     logger.info("提交登录...")
     try:
@@ -1086,6 +1170,7 @@ def process_account(account_index: int, email: str, password: str, proxy: Option
 
     try:
         with SB(**sb_kwargs) as sb:
+            _patch_execute_script(sb)
             status = handle_initial_page(sb, account_index, result)
             if status is None:
                 result["message"] = "Cloudflare 绕过失败或 AdBlocker 拦截"
