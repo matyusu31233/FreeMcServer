@@ -1016,6 +1016,33 @@ def renew_server(sb, server_id: str, server_name: str, account_index: int, resul
         sb.uc_open_with_reconnect(renew_url, reconnect_time=8)
         time.sleep(5)
 
+        # ── Cloudflare 整页挑战（Just a moment...）：原地等放行，不要刷新 ──
+        # 2026-11-10 14:41 UTC 运行的诊断实证：续订页三次打开都被整页挑战
+        # 拦住（标题 Just a moment...、正文 Performing security verification、
+        # 每次 Ray ID 都不同），约 20 秒的常规等待不够挑战自动完成，
+        # 重新打开只会换个 Ray ID 重新排队。改法：识别到挑战就留在当前页
+        # 耐心等，JS 挑战通常 30~90 秒内自动放行，期间定时补点验证框。
+        if is_cloudflare_interstitial(sb):
+            logger.warning("续订页被 Cloudflare 整页挑战拦住，原地等待放行（不刷新）…")
+            waited = 0
+            click_at = [10, 45]
+            while waited < 90 and is_cloudflare_interstitial(sb):
+                if click_at and waited >= click_at[0]:
+                    click_at.pop(0)
+                    try:
+                        sb.uc_gui_click_captcha()
+                        logger.info("已尝试点击 Cloudflare 挑战验证框")
+                    except Exception as e:
+                        logger.warning(f"点击挑战验证框失败: {e}")
+                time.sleep(3)
+                waited += 3
+            if is_cloudflare_interstitial(sb):
+                logger.warning(f"Cloudflare 挑战等待约 {waited} 秒仍未放行，继续按未就绪处理")
+            else:
+                logger.info(f"✅ Cloudflare 挑战已放行（约等了 {waited} 秒）")
+                time.sleep(3)
+
+
         # 滚动到验证组件
         sb.execute_script('window.scrollTo(0, document.body.scrollHeight);')
         time.sleep(2)
@@ -1037,16 +1064,20 @@ def renew_server(sb, server_id: str, server_name: str, account_index: int, resul
             result
         )
 
-        # 等待页面关键元素就绪
+        # 等待页面关键元素就绪（挑战放行瞬间页面会整页跳转，execute_script
+        # 可能抛异常，按未就绪处理、继续等）
         page_ready = False
-        for _ in range(10):
-            page_ready = sb.execute_script('''
+        for _ in range(20):
+            try:
+                page_ready = sb.execute_script('''
                 (function() {
                     return !!(document.querySelector('#renew-btn') ||
                              document.querySelector('.cf-turnstile') ||
                              document.querySelector('#captcha-warning'));
                 })();
             ''')
+            except Exception:
+                page_ready = False
             if page_ready:
                 break
             time.sleep(1)
