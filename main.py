@@ -1052,6 +1052,32 @@ def renew_server(sb, server_id: str, server_name: str, account_index: int, resul
             time.sleep(1)
 
         if not page_ready:
+            # 页面就绪判据（#renew-btn / .cf-turnstile / #captcha-warning）一个都没出现时，
+            # 把落地页的真实面貌打进日志：最终 URL、标题、关键元素计数、页面上所有
+            # 按钮的 id+文字、正文前 300 字。下次失败不用再靠截图猜页面长什么样。
+            try:
+                diag = sb.execute_script('''
+                    (function() {
+                        var text = (document.body ? document.body.innerText : '').replace(/\\s+/g, ' ').slice(0, 300);
+                        function n(s) { return document.querySelectorAll(s).length; }
+                        var btns = Array.prototype.map.call(
+                            document.querySelectorAll('button, a.btn, input[type="submit"]'),
+                            function(b) { return (b.id || '-') + ':' + (b.innerText || b.value || '').trim().slice(0, 30); }
+                        ).slice(0, 8);
+                        return {
+                            url: location.href,
+                            title: document.title || '',
+                            renewBtn: n('#renew-btn'),
+                            turnstile: n('.cf-turnstile'),
+                            captchaWarning: n('#captcha-warning'),
+                            buttons: btns,
+                            text: text
+                        };
+                    })();
+                ''')
+                logger.error(f"续订页面诊断: {diag}")
+            except Exception as e:
+                logger.error(f"续订页面诊断失败: {e}")
             logger.error(f"续订页面未加载（第 {renew_attempt} 次），"
                          + ("重试…" if renew_attempt < MAX_RENEW_RETRIES else "放弃。"))
             continue
