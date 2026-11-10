@@ -703,7 +703,7 @@ def _wait_login_turnstile_token(sb, timeout=30) -> bool:
     改为检查所有同名输入框，任一有 token 即算完成。
     """
     last_len = 0
-    for _ in range(timeout):
+    for elapsed in range(timeout):
         token_len = sb.execute_script('''
             var inputs = document.querySelectorAll('input[name="cf-turnstile-response"]');
             var max = 0;
@@ -717,8 +717,21 @@ def _wait_login_turnstile_token(sb, timeout=30) -> bool:
             return True
         if token_len != last_len:
             last_len = token_len
+        # 每 15 秒补点一次复选框：组件会停在 Verifying 状态，
+        # 只在开始点一次不够，需要在等待期间反复补点。
+        if elapsed > 0 and elapsed % 15 == 0:
+            try:
+                sb.uc_gui_click_captcha()
+                logger.info("等待中补点 Turnstile 复选框")
+            except Exception as e:
+                logger.warning(f"补点 Turnstile 失败: {e}")
         time.sleep(1)
-    logger.warning(f"超时未得到 token，最终长度 {last_len}")
+    try:
+        frames = sb.execute_script(
+            "return document.querySelectorAll('iframe[src*=\"challenges.cloudflare.com\"]').length;")
+    except Exception:
+        frames = "?"
+    logger.warning(f"超时未得到 token，最终长度 {last_len}，Turnstile iframe 数: {frames}")
     return False
 
 def handle_login_turnstile(sb, account_index: int, result: Dict) -> bool:
@@ -756,6 +769,16 @@ def handle_login_turnstile(sb, account_index: int, result: Dict) -> bool:
                 sb.uc_gui_click_captcha()
             except Exception as e:
                 logger.warning(f"uc_gui_click_captcha 失败: {e}")
+
+        # 把表单内的 Turnstile 滚到可见区域，GUI 按坐标点击才点得准
+        try:
+            sb.execute_script('''
+                var w = document.querySelector('#login-form .cf-turnstile') || document.querySelector('.cf-turnstile');
+                if (w) w.scrollIntoView({block: 'center'});
+            ''')
+            time.sleep(1)
+        except Exception:
+            pass
 
         logger.info("等待 Turnstile 完成验证...")
         if _wait_login_turnstile_token(sb, timeout=60):
@@ -830,7 +853,7 @@ def fill_and_submit(sb, email: str, password: str, account_index: int, result: D
     safe_screenshot(sb, screenshot_path(account_index, "03-form-filled"), result)
 
     # ---------- 处理登录 Turnstile ----------
-    max_turnstile_retries = 2
+    max_turnstile_retries = 4
     turnstile_ok = False
     for retry in range(max_turnstile_retries):
         if handle_login_turnstile(sb, account_index, result):
@@ -1172,7 +1195,12 @@ def process_account(account_index: int, email: str, password: str, proxy: Option
         "uc": True,
         "test": True,
         "locale": "en",
-        "headed": not is_linux(),
+        # 必须 headed：Linux 上靠 setup_display() 的虚拟显示跑有头浏览器。
+        # 旧写法在 Linux 用 headless，uc_gui_click_captcha 靠真实鼠标坐标点
+        # 复选框，无头模式下根本没有窗口可点，Turnstile 只能靠加载时自动
+        # 通过，加载没自动过的轮次就会一直卡在 token 长度 0（2026-11-10
+        # 01:03 UTC 的 Actions 运行两轮各等 60 秒全 0，即此问题）。
+        "headed": True,
         "chromium_arg": "--disable-blink-features=AutomationControlled",
     }
     if proxy:
