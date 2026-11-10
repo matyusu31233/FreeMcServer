@@ -32,20 +32,38 @@ logging.basicConfig(
 logger = logging.getLogger("freemcserver-keepalive")
 
 # ================== 兼容性修复 ==================
-def _patch_execute_script(sb):
-    """修复 execute_script 返回值丢失。
+_IIFE_OPEN_RE = re.compile(r"^\s*\(\s*function\s*\([^)]*\)\s*\{")
+_IIFE_CLOSE_RE = re.compile(r"\}\s*\)\s*\(\s*\)\s*;?\s*$")
 
-    本脚本大量 JS 以 `(function() { ... return x; })();` 开头。
-    在 WebDriver 的 execute_script 语义下，这种写法的返回值会被丢弃（恒为 None），
-    导致读状态的脚本（服务器状态、到期时间、服务器列表等）全部读到空值。
-    统一给这类脚本补上 `return ` 前缀后，返回值即可正常取回；
-    只产生副作用（点击/滚动）的脚本补前缀也无影响。
+
+def _unwrap_iife(script: str) -> str:
+    """把 `(function() { ... })();` 形式的脚本拆成裸脚本（函数体原样保留）。
+
+    两种执行环境对返回值的语义正好相反，只能用裸脚本 + 顶层 return 统一：
+    - 经典 WebDriver：脚本被包进函数体执行，IIFE 的返回值会被丢弃（恒为 None），
+      顶层 return 才是取回返回值的办法。
+    - CDP 模式（GitHub Actions 里的 SeleniumBase UC 驱动，2026-11-10 实测）：
+      裸脚本的顶层 return 能正常取回值（登录 token 长度 773 即如此读到）；
+      而给 IIFE 前面加 `return ` 会直接报 SyntaxError: Illegal return statement
+      ——2026-11-10 13:16 的 Actions 运行正是这样在 get_all_servers 崩掉的
+      （旧补丁加了 `return ` 前缀，登录虽成功，读服务器列表时整轮崩溃）。
+    拆掉 IIFE 外壳后，函数体里的 return 变成顶层 return，两种环境都能取回值；
+    只产生副作用（点击/滚动）的脚本拆开也无影响（函数体本就顺序执行）。
     """
+    s = script.strip()
+    m = _IIFE_OPEN_RE.match(s)
+    if not m or not _IIFE_CLOSE_RE.search(s):
+        return script
+    return _IIFE_CLOSE_RE.sub("", s[m.end():])
+
+
+def _patch_execute_script(sb):
+    """统一所有 execute_script 的 IIFE 脚本为裸脚本，见 _unwrap_iife 说明。"""
     orig_execute_script = sb.execute_script
 
     def wrapped(script, *args, **kwargs):
-        if isinstance(script, str) and script.lstrip().startswith("(function"):
-            script = "return " + script.lstrip()
+        if isinstance(script, str):
+            script = _unwrap_iife(script)
         return orig_execute_script(script, *args, **kwargs)
 
     sb.execute_script = wrapped
