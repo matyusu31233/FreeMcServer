@@ -25,7 +25,7 @@ jobs:
       - name: 安装依赖
         run: |
           sudo apt-get update && sudo apt-get install -y xvfb
-          pip install "seleniumbase>=4.25.0" "pyvirtualdisplay>=3.0" "requests>=2.31.0"
+          pip install "seleniumbase==4.57.1" "pyvirtualdisplay>=3.0" "requests>=2.31.0"
 
       - name: 配置代理
         env:
