@@ -1016,17 +1016,37 @@ def renew_server(sb, server_id: str, server_name: str, account_index: int, resul
         sb.uc_open_with_reconnect(renew_url, reconnect_time=8)
         time.sleep(5)
 
-        # ── Cloudflare 整页挑战（Just a moment...）：原地等放行，不要刷新 ──
-        # 2026-11-10 14:41 UTC 运行的诊断实证：续订页三次打开都被整页挑战
-        # 拦住（标题 Just a moment...、正文 Performing security verification、
-        # 每次 Ray ID 都不同），约 20 秒的常规等待不够挑战自动完成，
-        # 重新打开只会换个 Ray ID 重新排队。改法：识别到挑战就留在当前页
-        # 耐心等，JS 挑战通常 30~90 秒内自动放行，期间定时补点验证框。
-        if is_cloudflare_interstitial(sb):
-            logger.warning("续订页被 Cloudflare 整页挑战拦住，原地等待放行（不刷新）…")
-            waited = 0
-            click_at = [10, 45]
-            while waited < 90 and is_cloudflare_interstitial(sb):
+        # ── 等待续订页就绪（含 Cloudflare 整页挑战处理）──────────────────
+        # 2026-11-10 15:42 UTC 运行实证：上一版在打开后只单次检测整页挑战，
+        # 扑了空——导航刚提交时读到的还是旧页面/加载中状态，检测回了
+        # False；等页面稳定下来挑战页已经在了，脚本却已按「无挑战」走完
+        # 轮询并刷新重来，而每次重新打开只会换一个新的 Ray ID 重新排队。
+        # 改法：就绪等待与挑战等待合成为一个最长约 120 秒的轮询，每 3 秒
+        # 复检一次——先看 #renew-btn 等关键元素（六次诊断实证挑战页上这
+        # 三个选择器恒为 0，先查就绪不会误判），出现了算就绪；否则若识别
+        # 到整页挑战就留在当前页等它自动放行（约 10 秒、45 秒各补点一次
+        # 验证框），不刷新、不重新导航；其余情况（还在加载）继续等。
+        page_ready = False
+        challenge_seen = False
+        waited = 0
+        click_at = [10, 45]
+        while waited < 120:
+            try:
+                page_ready = sb.execute_script('''
+                (function() {
+                    return !!(document.querySelector('#renew-btn') ||
+                             document.querySelector('.cf-turnstile') ||
+                             document.querySelector('#captcha-warning'));
+                })();
+            ''')
+            except Exception:
+                page_ready = False
+            if page_ready:
+                break
+            if is_cloudflare_interstitial(sb):
+                if not challenge_seen:
+                    challenge_seen = True
+                    logger.warning("续订页被 Cloudflare 整页挑战拦住，原地等待放行（不刷新）…")
                 if click_at and waited >= click_at[0]:
                     click_at.pop(0)
                     try:
@@ -1034,14 +1054,13 @@ def renew_server(sb, server_id: str, server_name: str, account_index: int, resul
                         logger.info("已尝试点击 Cloudflare 挑战验证框")
                     except Exception as e:
                         logger.warning(f"点击挑战验证框失败: {e}")
-                time.sleep(3)
-                waited += 3
-            if is_cloudflare_interstitial(sb):
-                logger.warning(f"Cloudflare 挑战等待约 {waited} 秒仍未放行，继续按未就绪处理")
+            time.sleep(3)
+            waited += 3
+        if challenge_seen:
+            if page_ready:
+                logger.info(f"✅ Cloudflare 挑战已放行，续订页就绪（本轮约等了 {waited} 秒）")
             else:
-                logger.info(f"✅ Cloudflare 挑战已放行（约等了 {waited} 秒）")
-                time.sleep(3)
-
+                logger.warning(f"Cloudflare 挑战本轮等待约 {waited} 秒仍未放行，按未就绪处理")
 
         # 滚动到验证组件
         sb.execute_script('window.scrollTo(0, document.body.scrollHeight);')
@@ -1063,24 +1082,6 @@ def renew_server(sb, server_id: str, server_name: str, account_index: int, resul
                              f"08-renew-page-{mask_server_id(server_id)}-a{renew_attempt}"),
             result
         )
-
-        # 等待页面关键元素就绪（挑战放行瞬间页面会整页跳转，execute_script
-        # 可能抛异常，按未就绪处理、继续等）
-        page_ready = False
-        for _ in range(20):
-            try:
-                page_ready = sb.execute_script('''
-                (function() {
-                    return !!(document.querySelector('#renew-btn') ||
-                             document.querySelector('.cf-turnstile') ||
-                             document.querySelector('#captcha-warning'));
-                })();
-            ''')
-            except Exception:
-                page_ready = False
-            if page_ready:
-                break
-            time.sleep(1)
 
         if not page_ready:
             # 页面就绪判据（#renew-btn / .cf-turnstile / #captcha-warning）一个都没出现时，
