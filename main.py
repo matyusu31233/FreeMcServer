@@ -641,31 +641,20 @@ def handle_turnstile_verification(sb, account_index: int, result: Dict,
             logger.info("未检测到 Turnstile 组件，视为通过")
             return True
 
-        logger.info(f"发现 Turnstile 组件（第 {page_round} 轮），开始点击尝试…")
+        logger.info(f"发现 Turnstile 组件（第 {page_round} 轮），改为被动等待模式…")
 
-        # ── 3 次主动点击 ──────────────────────────────────────────────────
+        # ── PATCHED 2026-11-11: 续期页先被动等待 120 秒，全程不主动点击 ──
+        # 依据：原版一进续期页就 uc_gui_click_captcha 连点 3 次，组件一直
+        # 停在 "Verifying..."、token 始终为 0；而登录页没人点、5 秒就自动
+        # 出 token。猜想主动点击打断了组件的自动验证流程。本轮做纯被动
+        # 实验：0 次点击，只等 token 自己出现，最长 120 秒。
         verified = False
-        for attempt in range(1, 4):
-            logger.info(f"  Turnstile 点击尝试 {attempt}/3（轮 {page_round}/{max_page_retries}）")
-            try:
-                sb.uc_gui_click_captcha()
-            except Exception as e:
-                logger.warning(f"  uc_gui_click_captcha 失败: {e}")
-
-            if _wait_for_turnstile_token(sb, timeout=25):
-                logger.info(f"  ✅ Turnstile 点击成功（第 {attempt} 次）")
-                verified = True
-                break
-
-            # 每次点击失败后滚回组件
-            _scroll_to_turnstile()
-
-        # ── 被动等待 30 秒 ────────────────────────────────────────────────
-        if not verified:
-            logger.info(f"  点击均未成功，被动等待 Turnstile 自动完成（30 秒）…")
-            if _wait_for_turnstile_token(sb, timeout=30):
-                logger.info("  ✅ Turnstile 自动完成")
-                verified = True
+        logger.info("  被动等待 Turnstile 自动完成（120 秒，全程不点击）…")
+        if _wait_for_turnstile_token(sb, timeout=120):
+            logger.info("  ✅ Turnstile 被动等待成功（未点击）")
+            verified = True
+        else:
+            logger.info("  被动等待 120 秒仍无 token，本轮不点击，直接判失败")
 
         # ── 本轮验证成功 ──────────────────────────────────────────────────
         if verified:
@@ -1130,58 +1119,120 @@ def renew_server(sb, server_id: str, server_name: str, account_index: int, resul
             time.sleep(3)
             continue  # 外层循环重新 uc_open_with_reconnect
 
-        # ── 点击续订按钮 ────────────────────────────────────────────────
+        # ── 点击续订按钮（V3：点可见的 btn-extend-server 按钮）──────
+        # 背景（2026-11-11 V2 实测）：#renew-btn 是隐藏元素（class 带
+        # d-none、disabled、从不可见），强制启用点击 3 次毫无反应；
+        # 页面上真正可见、可点的 "Renew Server Now" 是另一个元素：
+        # class=btn-extend-server、id=btn-extend-<随机串>（每次加载不同，
+        # 只能按 class 定位）。V3 改为用 WebDriver 真实点击这个可见按钮，
+        # JS click 兜底；点击后把页面上任何 swal 弹窗的原文打进日志，
+        # 服务端若拒绝（如 captcha 无效）也能看到原因。
         try:
-            sb.execute_script('''
-                (function() {
-                    var btn = document.querySelector('#renew-btn');
-                    if (btn) btn.scrollIntoView({behavior:'smooth', block:'center'});
-                })();
-            ''')
-            time.sleep(1)
-
-            btn_enabled = False
-            for i in range(15):
-                btn_enabled = sb.execute_script('''
+            try:
+                diag = sb.execute_script('''
                     (function() {
-                        var btn = document.querySelector('#renew-btn');
-                        return btn && !btn.disabled;
+                        function info(el) {
+                            if (!el) return null;
+                            var s = window.getComputedStyle(el);
+                            return {
+                                tag: el.tagName, id: el.id || '-',
+                                disabled: !!el.disabled,
+                                cls: (el.className || '').toString().slice(0, 60),
+                                text: (el.innerText || '').trim().slice(0, 40),
+                                visible: s.display !== 'none' && s.visibility !== 'hidden'
+                            };
+                        }
+                        var tokenLen = 0;
+                        document.querySelectorAll('input[name="cf-turnstile-response"]').forEach(function(i) {
+                            if (i.value.length > tokenLen) tokenLen = i.value.length;
+                        });
+                        var cands = [];
+                        document.querySelectorAll('button, a').forEach(function(el) {
+                            var t = (el.innerText || '').trim();
+                            if (t.includes('Renew')) cands.push(info(el));
+                        });
+                        return {
+                            tokenLen: tokenLen,
+                            renewBtn: info(document.querySelector('#renew-btn')),
+                            candidates: cands.slice(0, 5)
+                        };
                     })();
                 ''')
-                if btn_enabled:
-                    logger.info(f"续订按钮已启用（等待 {i+1} 秒）")
-                    break
-                time.sleep(1)
+                logger.info(f"续订按钮诊断: {diag}")
+            except Exception as e:
+                logger.warning(f"续订按钮诊断失败: {e}")
 
-            if not btn_enabled:
-                logger.error("续订按钮未启用，跳过本次尝试")
-                continue
-
-            clicked = sb.execute_script('''
+            # 找到可见按钮的 id（id 随机，只能按 class + 可见性定位）
+            visible_btn_id = sb.execute_script('''
                 (function() {
-                    var btn = document.querySelector('#renew-btn');
-                    if (btn && !btn.disabled) { btn.click(); return true; }
-                    return false;
+                    var els = document.querySelectorAll('button.btn-extend-server');
+                    for (var i = 0; i < els.length; i++) {
+                        var s = window.getComputedStyle(els[i]);
+                        if (s.display !== 'none' && s.visibility !== 'hidden' && !els[i].disabled) {
+                            els[i].scrollIntoView({behavior:'smooth', block:'center'});
+                            return els[i].id;
+                        }
+                    }
+                    return null;
                 })();
             ''')
+            logger.info(f"可见续订按钮 id: {visible_btn_id}")
+            time.sleep(1)
+
+            clicked = False
+            if visible_btn_id:
+                try:
+                    el = sb.find_element(f"#{visible_btn_id}")
+                    el.click()
+                    clicked = True
+                    logger.info("✅ 点击可见续订按钮（WebDriver 真实点击）")
+                except Exception as e:
+                    logger.warning(f"真实点击失败，改用 JS 点击: {e}")
 
             if not clicked:
-                try:
-                    renew_btn = sb.find_element("#renew-btn")
-                    if renew_btn and renew_btn.is_enabled():
-                        renew_btn.click()
-                        logger.info("✅ 点击续订按钮（SeleniumBase）")
-                    else:
-                        continue
-                except Exception as e:
-                    logger.error(f"点击失败: {e}")
-                    continue
-            else:
-                logger.info("✅ 点击续订按钮（JavaScript）")
+                clicked = sb.execute_script('''
+                    (function() {
+                        var els = document.querySelectorAll('button.btn-extend-server');
+                        for (var i = 0; i < els.length; i++) {
+                            var s = window.getComputedStyle(els[i]);
+                            if (s.display !== 'none' && s.visibility !== 'hidden' && !els[i].disabled) {
+                                els[i].click();
+                                return true;
+                            }
+                        }
+                        return false;
+                    })();
+                ''')
+                if clicked:
+                    logger.info("✅ 点击可见续订按钮（JavaScript 兜底）")
+
+            if not clicked:
+                logger.error("找不到可见的续订按钮，跳过本次尝试")
+                continue
 
         except Exception as e:
             logger.error(f"无法点击续订按钮: {e}")
             continue
+
+        # 点击后扫一遍任何 swal 弹窗（含报错），把原文记下来
+        for _ in range(6):
+            time.sleep(2)
+            try:
+                popup = sb.execute_script('''
+                    (function() {
+                        var p = document.querySelector('.swal2-popup.swal2-show');
+                        if (!p) return null;
+                        var t = document.querySelector('#swal2-title');
+                        var b = document.querySelector('#swal2-html-container');
+                        return {cls: p.className, title: t ? t.innerText : '', body: b ? b.innerText : ''};
+                    })();
+                ''')
+                if popup:
+                    logger.info(f"点击后弹窗: {popup}")
+                    if 'swal2-icon-success' in (popup.get('cls') or ''):
+                        break
+            except Exception:
+                pass
 
         time.sleep(5)
         safe_screenshot(
@@ -1191,16 +1242,17 @@ def renew_server(sb, server_id: str, server_name: str, account_index: int, resul
             result
         )
 
-        # ── 检查续订成功弹窗 ────────────────────────────────────────────
+        # ── 检查续订成功弹窗（V2：等待放宽到 25 秒，判据放宽并记录原文）──
         try:
-            sb.wait_for_element_visible('.swal2-icon-success', timeout=10)
+            sb.wait_for_element_visible('.swal2-icon-success', timeout=25)
             success_text = sb.execute_script('''
                 (function() {
                     var el = document.querySelector('#swal2-html-container');
                     return el ? el.innerText : '';
                 })();
             ''')
-            if "renewed" in success_text.lower():
+            logger.info(f"续订弹窗文本: {success_text}")
+            if "renewed" in success_text.lower() or "success" in success_text.lower():
                 server_result["success"] = True
                 logger.info(f"✅ 服务器 {masked_name} 续订成功（第 {renew_attempt} 次）")
             safe_screenshot(
@@ -1225,6 +1277,20 @@ def renew_server(sb, server_id: str, server_name: str, account_index: int, resul
         )
         time.sleep(3)
     # ── 重试循环结束 ────────────────────────────────────────────────────
+
+    # V2 兜底确认：弹窗没抓到不等于没续上——重新读到期时间，
+    # 若比续订前变晚，以到期时间变化为准判定成功。
+    if not server_result["success"]:
+        try:
+            after_check = get_server_expiry(sb, server_id)
+            before_check = server_result.get("before", "")
+            logger.info(f"到期时间兜底核对: before={before_check} after={after_check}")
+            if before_check and after_check and after_check > before_check:
+                server_result["success"] = True
+                server_result["after"] = after_check
+                logger.info("✅ 通过到期时间变化确认续订成功（弹窗未捕获）")
+        except Exception as e:
+            logger.warning(f"到期时间兜底核对失败: {e}")
 
     # 获取续订后到期时间 & 启动服务器
     if server_result["success"]:
